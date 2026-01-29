@@ -8,7 +8,7 @@ venv/
 !old_docs/*.jpg
 
 # Other common ignores
-clustered_output/clip_embeddings.json
+clustered_output/
 __pycache__/
 *.pyc
 *.pyo

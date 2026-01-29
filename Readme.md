@@ -24,7 +24,7 @@ Warehouse bins contain multiple products that need to be:
 - **Identified** - Classified into **5,000+ unique product SKUs**
 - **Verified** - Matched against expected inventory lists
 
-![Example Bin Image](old_docs\Bin Images.jpg)
+![Example Bin Image](old_docs/Bin%20Images.jpg)
 *A typical warehouse bin with multiple products requiring detection and classification*
 
 **Example**: In a single bin image containing nutrition supplements (mass gainer, BCAA strawberry box, and headphones), the system needs to:
@@ -49,7 +49,9 @@ Warehouse bins contain multiple products that need to be:
 
 ## 🎬 Project Demo
 
-[![Project Walkthrough](old_docs\Bin Images Viewer Streamlit.jpg)(old_docs\video2846967579.mp4)
+https://github.com/MurtuzaMorbiwala/Bin_Image_Product_Detection/blob/2e1cff24113183e4f9925a8635d017e11de0080b/old_docs/video2846967579.mp4
+
+![Project Walkthrough](old_docs/Bin%20Images%20Viewer%20Streamlit.jpg)
 *Watch the full project walkthrough and technical explanation by Murtaza Morbiwala*
 
 ### Demo Highlights

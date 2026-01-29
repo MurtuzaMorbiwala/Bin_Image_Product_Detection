@@ -48,10 +48,9 @@ Warehouse bins contain multiple products that need to be:
 ---
 
 ## 🎬 Project Demo
+[![Project Demo](old_docs/Bin%20Images%20Viewer%20Streamlit.jpg)](https://youtu.be/l2pACkyRZIs)
 
-https://github.com/MurtuzaMorbiwala/Bin_Image_Product_Detection/blob/2e1cff24113183e4f9925a8635d017e11de0080b/old_docs/video2846967579.mp4
-
-![Project Walkthrough](old_docs/Bin%20Images%20Viewer%20Streamlit.jpg)
+![Project Walkthrough]()
 *Watch the full project walkthrough and technical explanation by Murtaza Morbiwala*
 
 ### Demo Highlights

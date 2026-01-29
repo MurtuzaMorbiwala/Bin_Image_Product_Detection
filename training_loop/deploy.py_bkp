@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+Deploy Training Loop to Kaggle
+Creates dataset with metadata and pushes training loop script
+"""
+
+import os
+os.environ["PYTHONUTF8"] = "1"
+
+import sys
+import json
+import time
+import shutil
+import zipfile
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from kaggle.api.kaggle_api_extended import KaggleApi
+except ImportError:
+    print("Kaggle API not installed! Run: pip install kaggle")
+    sys.exit(1)
+
+
+class LoopDeployer:
+    def __init__(self):
+        print("Initializing Kaggle API...")
+        self.api = KaggleApi()
+        self.api.authenticate()
+        
+        config = Path.home() / '.kaggle' / 'kaggle.json'
+        self.username = json.load(open(config))['username']
+        print(f"Authenticated as: {self.username}")
+        
+        self.dataset_slug = "binsense-loop"
+        self.kernel_slug = "binsense-training-loop"
+    
+    def prepare_dataset(self):
+        """Prepare dataset with metadata for training loop"""
+        print("\n" + "="*60)
+        print("STEP 1: Preparing Dataset")
+        print("="*60)
+        
+        working_dir = Path("data/working")
+        snapshot_dir = Path("data/snapshots/binsense")
+        
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+        snapshot_dir.mkdir(parents=True)
+        
+        # Copy images
+        images_dst = snapshot_dir / "images"
+        shutil.copytree(working_dir / "images", images_dst)
+        img_count = len(list(images_dst.glob('*')))
+        print(f"  Images: {img_count}")
+        
+        # Copy labels
+        labels_dst = snapshot_dir / "labels"
+        shutil.copytree(working_dir / "annotations", labels_dst)
+        label_count = len(list(labels_dst.glob('*.txt')))
+        print(f"  Labels: {label_count}")
+        
+        # Copy metadata
+        meta_dst = snapshot_dir / "metadata"
+        shutil.copytree(working_dir / "metadata", meta_dst)
+        meta_count = len(list(meta_dst.glob('*.json')))
+        print(f"  Metadata: {meta_count}")
+        
+        # Copy product_mapping.json (tracks labeled images)
+        mapping_src = Path("data/product_mapping.json")
+        if mapping_src.exists():
+            shutil.copy(mapping_src, snapshot_dir / "product_mapping.json")
+            print("  product_mapping.json: copied")
+        
+        # Copy pretrained weights if available
+        weights_src = Path("data/best.pt")
+        if weights_src.exists():
+            shutil.copy(weights_src, snapshot_dir / "best.pt")
+            print("  best.pt: copied (pretrained weights)")
+        
+        # Create data.yaml for working directory
+        yaml_content = """path: '/kaggle/working/data'
+train: images
+val: images
+nc: 1
+names: ['product']
+"""
+        with open(snapshot_dir / "data.yaml", 'w') as f:
+            f.write(yaml_content)
+        
+        # Create zip
+        zip_path = Path(f"data/snapshots/{self.dataset_slug}.zip")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file in snapshot_dir.rglob('*'):
+                if file.is_file():
+                    arcname = f"binsense/{file.relative_to(snapshot_dir)}"
+                    zf.write(file, arcname)
+        
+        size_mb = zip_path.stat().st_size / 1024 / 1024
+        print(f"\nCreated: {zip_path} ({size_mb:.1f} MB)")
+        
+        return zip_path, snapshot_dir
+    
+    def upload_dataset(self, zip_path, snapshot_dir):
+        """Upload dataset to Kaggle"""
+        print("\n" + "="*60)
+        print("STEP 2: Uploading Dataset")
+        print("="*60)
+        
+        # Create dataset metadata in snapshot dir (not parent with other zips)
+        metadata = {
+            "title": "BinSense Loop",
+            "id": f"{self.username}/{self.dataset_slug}",
+            "licenses": [{"name": "CC0-1.0"}]
+        }
+        
+        with open(snapshot_dir / "dataset-metadata.json", 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Check if exists
+        try:
+            self.api.dataset_status(f"{self.username}/{self.dataset_slug}")
+            print(f"Updating existing dataset: {self.dataset_slug}")
+            self.api.dataset_create_version(
+                str(snapshot_dir),
+                version_notes=f"Updated {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                dir_mode='zip',
+                quiet=False
+            )
+        except:
+            print(f"Creating new dataset: {self.dataset_slug}")
+            self.api.dataset_create_new(
+                str(snapshot_dir),
+                dir_mode='zip',
+                quiet=False
+            )
+        
+        print("Dataset uploaded")
+        return f"https://www.kaggle.com/datasets/{self.username}/{self.dataset_slug}"
+    
+    def push_kernel(self, debug=False):
+        """Push training loop script"""
+        print("\n" + "="*60)
+        print("STEP 3: Pushing Training Loop Script")
+        print("="*60)
+        
+        import tempfile
+        kernel_dir = Path(tempfile.mkdtemp())
+        
+        try:
+            # Kernel metadata
+            metadata = {
+                "id": f"{self.username}/{self.kernel_slug}",
+                "title": "BinSense Training Loop",
+                "code_file": "kaggle_loop.py",
+                "language": "python",
+                "kernel_type": "script",
+                "is_private": True,
+                "enable_gpu": True,
+                "enable_internet": True,
+                "dataset_sources": [f"{self.username}/{self.dataset_slug}"],
+                "competition_sources": [],
+                "kernel_sources": []
+            }
+            
+            with open(kernel_dir / "kernel-metadata.json", 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            # Copy script
+            script_src = Path(__file__).parent / "kaggle_loop.py"
+            with open(script_src, 'r', encoding='utf-8') as f:
+                script_content = f.read()
+            
+            with open(kernel_dir / "kaggle_loop.py", 'w', encoding='utf-8') as f:
+                f.write(script_content)
+            
+            print(f"Pushing: {self.username}/{self.kernel_slug}")
+            if debug:
+                print("  Mode: DEBUG (reduced epochs and image size)")
+            self.api.kernels_push(str(kernel_dir))
+            print("Kernel pushed")
+            
+        finally:
+            shutil.rmtree(kernel_dir, ignore_errors=True)
+        
+        return f"https://www.kaggle.com/code/{self.username}/{self.kernel_slug}"
+    
+    def check_status(self):
+        """Check kernel status"""
+        print("\nChecking kernel status...")
+        status = self.api.kernels_status(f"{self.username}/{self.kernel_slug}")
+        print(f"Status: {status}")
+        return status
+    
+    def download_output(self):
+        """Download training outputs"""
+        print("\n" + "="*60)
+        print("Downloading Output")
+        print("="*60)
+        
+        output_dir = Path("kaggle_output")
+        output_dir.mkdir(exist_ok=True)
+        
+        self.api.kernels_output(
+            f"{self.username}/{self.kernel_slug}",
+            str(output_dir)
+        )
+        
+        # List downloaded files
+        for f in output_dir.glob('*'):
+            size = f.stat().st_size / 1024 / 1024
+            print(f"  {f.name} ({size:.2f} MB)")
+        
+        print(f"\nModel saved to: {output_dir / 'best.pt'}")
+    
+    def deploy(self, debug=False):
+        """Full deployment pipeline"""
+        # Step 1: Prepare
+        zip_path, snapshot_dir = self.prepare_dataset()
+        
+        # Step 2: Upload
+        time.sleep(2)
+        dataset_url = self.upload_dataset(zip_path, snapshot_dir)
+        print(f"Dataset: {dataset_url}")
+        
+        # Wait for dataset processing
+        print("\nWaiting for dataset processing...")
+        time.sleep(15)
+        
+        # Step 3: Push kernel
+        kernel_url = self.push_kernel(debug=debug)
+        
+        print("\n" + "="*60)
+        print("DEPLOYMENT COMPLETE")
+        print("="*60)
+        print(f"Dataset: {dataset_url}")
+        print(f"Kernel:  {kernel_url}")
+        if debug:
+            print("Mode: DEBUG (reduced epochs and image size)")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Deploy BinSense training loop to Kaggle')
+    parser.add_argument('--prepare-only', action='store_true', help='Only prepare dataset')
+    parser.add_argument('--push-only', action='store_true', help='Only push kernel')
+    parser.add_argument('--status', action='store_true', help='Check kernel status')
+    parser.add_argument('--download', action='store_true', help='Download outputs')
+    parser.add_argument('--debug', action='store_true', help='Run kernel in debug mode with reduced epochs and image size')
+    args = parser.parse_args()
+    
+    deployer = LoopDeployer()
+    
+    if args.prepare_only:
+        deployer.prepare_dataset()
+    elif args.push_only:
+        deployer.push_kernel(debug=args.debug)
+    elif args.status:
+        deployer.check_status()
+    elif args.download:
+        deployer.download_output()
+    else:
+        deployer.deploy(debug=args.debug)
+
+
+if __name__ == "__main__":
+    main()

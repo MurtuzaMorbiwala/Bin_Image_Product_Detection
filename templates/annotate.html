@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Annotation Tool</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            margin-top: 0;
+            color: #333;
+        }
+        .controls {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .control-group {
+            flex: 1;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        select, button {
+            width: 100%;
+            padding: 10px;
+            font-size: 14px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button.delete {
+            background: #f44336;
+        }
+        button.delete:hover {
+            background: #da190b;
+        }
+        .canvas-container {
+            position: relative;
+            display: inline-block;
+            margin-top: 20px;
+        }
+        canvas {
+            border: 2px solid #ddd;
+            cursor: crosshair;
+            display: block;
+        }
+        .info {
+            margin-top: 20px;
+            padding: 15px;
+            background: #e3f2fd;
+            border-radius: 4px;
+            color: #1976d2;
+        }
+        .product-list {
+            margin-top: 10px;
+        }
+        .product-item {
+            padding: 8px;
+            margin: 5px 0;
+            background: #f9f9f9;
+            border-left: 3px solid #4CAF50;
+            cursor: pointer;
+        }
+        .product-item:hover {
+            background: #e8f5e9;
+        }
+        .product-item.selected {
+            background: #c8e6c9;
+            border-left-color: #2e7d32;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏷️ Annotation Tool - Click & Drag to Draw</h1>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label>Select Image:</label>
+                <select id="imageSelect"></select>
+            </div>
+            <div class="control-group">
+                <label>Actions:</label>
+                <button onclick="saveAnnotation()">💾 Save Bounding Box</button>
+            </div>
+            <div class="control-group">
+                <label>&nbsp;</label>
+                <button class="delete" onclick="deleteAnnotation()">🗑️ Delete Box</button>
+            </div>
+        </div>
+        
+        <div class="info">
+            <strong>Instructions:</strong> Select a product below, then <strong>click and drag</strong> on the image to draw a bounding box. Press "Save" when done.
+        </div>
+        
+        <div class="product-list" id="productList"></div>
+        
+        <div class="canvas-container">
+            <canvas id="canvas"></canvas>
+        </div>
+    </div>
+
+    <script>
+        let canvas, ctx;
+        let currentImage = null;
+        let currentImageId = null;
+        let currentProduct = null;
+        let products = [];
+        let annotations = [];
+        
+        let isDrawing = false;
+        let startX, startY;
+        let currentBox = null;
+        
+        // Initialize
+        window.onload = function() {
+            canvas = document.getElementById('canvas');
+            ctx = canvas.getContext('2d');
+            
+            // Mouse events
+            canvas.addEventListener('mousedown', startDrawing);
+            canvas.addEventListener('mousemove', draw);
+            canvas.addEventListener('mouseup', stopDrawing);
+            
+            // Load images
+            loadImages();
+        };
+        
+        function loadImages() {
+            fetch('/api/images')
+                .then(r => r.json())
+                .then(data => {
+                    const select = document.getElementById('imageSelect');
+                    data.images.forEach(img => {
+                        const option = document.createElement('option');
+                        option.value = img;
+                        option.textContent = img;
+                        select.appendChild(option);
+                    });
+                    
+                    select.onchange = () => loadImage(select.value);
+                    if (data.images.length > 0) {
+                        loadImage(data.images[0]);
+                    }
+                });
+        }
+        
+        function loadImage(imageId) {
+            currentImageId = imageId;
+            
+            // Load image
+            const img = new Image();
+            img.onload = function() {
+                canvas.width = img.width;
+                canvas.height = img.height;
+                currentImage = img;
+                redraw();
+            };
+            img.src = `/api/image/${imageId}`;
+            
+            // Load products
+            fetch(`/api/products/${imageId}`)
+                .then(r => r.json())
+                .then(data => {
+                    products = data.products;
+                    displayProducts();
+                });
+            
+            // Load annotations
+            fetch(`/api/annotations/${imageId}`)
+                .then(r => r.json())
+                .then(data => {
+                    annotations = data.annotations;
+                    redraw();
+                });
+        }
+        
+        function displayProducts() {
+            const list = document.getElementById('productList');
+            list.innerHTML = '<strong>Select Product to Annotate:</strong>';
+            
+            products.forEach((product, idx) => {
+                const div = document.createElement('div');
+                div.className = 'product-item';
+                div.textContent = `${idx + 1}. ${product.name}`;
+                div.onclick = () => selectProduct(product);
+                list.appendChild(div);
+            });
+        }
+        
+        function selectProduct(product) {
+            currentProduct = product;
+            currentBox = null;
+            
+            // Update UI
+            document.querySelectorAll('.product-item').forEach(el => {
+                el.classList.remove('selected');
+            });
+            event.target.classList.add('selected');
+            
+            redraw();
+        }
+        
+        function startDrawing(e) {
+            if (!currentProduct) {
+                alert('Please select a product first!');
+                return;
+            }
+            
+            isDrawing = true;
+            const rect = canvas.getBoundingClientRect();
+            startX = e.clientX - rect.left;
+            startY = e.clientY - rect.top;
+        }
+        
+        function draw(e) {
+            if (!isDrawing) return;
+            
+            const rect = canvas.getBoundingClientRect();
+            const currentX = e.clientX - rect.left;
+            const currentY = e.clientY - rect.top;
+            
+            currentBox = {
+                x: Math.min(startX, currentX),
+                y: Math.min(startY, currentY),
+                width: Math.abs(currentX - startX),
+                height: Math.abs(currentY - startY)
+            };
+            
+            redraw();
+        }
+        
+        function stopDrawing() {
+            isDrawing = false;
+        }
+        
+        function redraw() {
+            if (!currentImage) return;
+            
+            // Clear and draw image
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(currentImage, 0, 0);
+            
+            // Draw existing annotations
+            annotations.forEach(ann => {
+                const x = (ann.x_center - ann.width / 2) * canvas.width;
+                const y = (ann.y_center - ann.height / 2) * canvas.height;
+                const w = ann.width * canvas.width;
+                const h = ann.height * canvas.height;
+                
+                // Grey for other products
+                ctx.strokeStyle = '#cccccc';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x, y, w, h);
+                
+                // Label
+                ctx.fillStyle = '#cccccc';
+                ctx.fillRect(x, y - 20, 80, 20);
+                ctx.fillStyle = '#333';
+                ctx.font = '12px Arial';
+                ctx.fillText(`Class ${ann.class_id}`, x + 5, y - 5);
+            });
+            
+            // Draw current box
+            if (currentBox) {
+                ctx.strokeStyle = '#00FF00';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(currentBox.x, currentBox.y, currentBox.width, currentBox.height);
+                
+                ctx.fillStyle = '#00FF00';
+                ctx.fillRect(currentBox.x, currentBox.y - 25, 200, 25);
+                ctx.fillStyle = 'white';
+                ctx.font = 'bold 14px Arial';
+                ctx.fillText('Current Box - Press Save', currentBox.x + 5, currentBox.y - 7);
+            }
+        }
+        
+        function saveAnnotation() {
+            if (!currentBox || !currentProduct) {
+                alert('Please draw a bounding box first!');
+                return;
+            }
+            
+            // Convert to YOLO format
+            const x_center = (currentBox.x + currentBox.width / 2) / canvas.width;
+            const y_center = (currentBox.y + currentBox.height / 2) / canvas.height;
+            const width = currentBox.width / canvas.width;
+            const height = currentBox.height / canvas.height;
+            
+            fetch(`/api/annotations/${currentImageId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    class_id: currentProduct.class_id,
+                    x_center: x_center,
+                    y_center: y_center,
+                    width: width,
+                    height: height
+                })
+            })
+            .then(r => r.json())
+            .then(() => {
+                alert('✅ Saved!');
+                currentBox = null;
+                loadImage(currentImageId);
+            });
+        }
+        
+        function deleteAnnotation() {
+            if (!currentProduct) {
+                alert('Please select a product first!');
+                return;
+            }
+            
+            fetch(`/api/annotations/${currentImageId}/${currentProduct.class_id}`, {
+                method: 'DELETE'
+            })
+            .then(r => r.json())
+            .then(() => {
+                alert('🗑️ Deleted!');
+                currentBox = null;
+                loadImage(currentImageId);
+            });
+        }
+    </script>
+</body>
+</html>

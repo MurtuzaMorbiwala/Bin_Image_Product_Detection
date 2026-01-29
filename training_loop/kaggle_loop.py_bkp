@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+Kaggle Training Loop - Runs multiple rounds of YOLO+CLIP training
+Upload this script to Kaggle along with the dataset
+"""
+
+import os
+os.environ['WANDB_DISABLED'] = 'true'
+os.environ['YOLO_VERBOSE'] = 'False'
+os.environ['YOLO_DOWNLOADS'] = '0'
+# Disable all YOLO downloads and verbose output
+os.environ['ULTRALYTICS_SETTINGS_PATH'] = '/tmp'  # Use temp directory for settings
+
+import sys
+import json
+from pathlib import Path
+import shutil
+
+# Config
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--debug', action='store_true', help='Enable debug mode with reduced epochs and image size')
+args = parser.parse_args()
+
+MAX_ROUNDS = 1 if args.debug else 10
+YOLO_EPOCHS_FIRST = 3 if args.debug else 100
+YOLO_EPOCHS_FINETUNE = 2 if args.debug else 30
+YOLO_EPOCHS_DEBUG = 2  # Epochs per round in debug mode
+YOLO_CONF = 0.5
+CLIP_CONF = 0.7
+MIN_NEW_LABELS = 1 if args.debug else 5
+IMG_SIZE = 320 if args.debug else 640
+BATCH_SIZE = 8 if args.debug else 16
+
+if args.debug:
+    print("\n" + "="*50)
+    print("DEBUG MODE: Reduced epochs and image size")
+    print(f"Epochs: First={YOLO_EPOCHS_FIRST}, Fine-tune={YOLO_EPOCHS_FINETUNE}")
+    print(f"Image size: {IMG_SIZE}x{IMG_SIZE}, Batch size: {BATCH_SIZE}")
+    print("="*50 + "\n")
+
+
+def setup():
+    """Install dependencies"""
+    print("Installing dependencies...")
+    os.system("pip install ultralytics ftfy regex -q")
+    os.system("pip install git+https://github.com/openai/CLIP.git -q")
+    os.system("pip install --force-reinstall 'numpy<2.0,>=1.26.0' -q")
+    
+    import torch
+    print(f"CUDA: {torch.cuda.is_available()}")
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def train_yolo(data_yaml, round_num, device, prev_weights=None):
+    """Train YOLO (quiet mode) - uses previous weights if available"""
+    import logging
+    import os
+    
+    # Suppress ALL YOLO output
+    logging.getLogger('ultralytics').setLevel(logging.ERROR)
+    os.environ['YOLO_VERBOSE'] = 'False'
+    
+    from ultralytics import YOLO
+    import ultralytics
+    ultralytics.utils.VERBOSE = False
+    
+    # Always try to use our pretrained weights first
+    pretrained_path = '/kaggle/input/binsense-loop/best.pt'
+    
+    if Path(pretrained_path).exists():
+        # Load our pretrained weights directly
+        print(f"  Using pretrained weights from {pretrained_path}", flush=True)
+        model = YOLO(pretrained_path)
+        epochs = 1 if args.debug else YOLO_EPOCHS_FINETUNE
+    elif prev_weights and Path(prev_weights).exists():
+        print(f"  Using previous round weights: {prev_weights}", flush=True)
+        model = YOLO(prev_weights)
+        epochs = 1 if args.debug else YOLO_EPOCHS_FINETUNE
+    else:
+        # Last resort - create a minimal model without downloading
+        print("  Creating minimal model (no downloads)", flush=True)
+        # Create a YOLO model without any pretrained weights
+        model = YOLO('yolov8n.yaml')  # Use config file instead of downloading
+        epochs = 1 if args.debug else YOLO_EPOCHS_FIRST
+    
+    model.train(
+        data=data_yaml,
+        epochs=YOLO_EPOCHS_DEBUG if args.debug and round_num > 1 else epochs,
+        imgsz=IMG_SIZE,
+        batch=BATCH_SIZE,
+        device=0,  # Use first GPU
+        workers=2 if args.debug else 4,  # Fewer workers in debug
+        pretrained=False,  # Don't download pretrained weights when using custom weights
+        verbose=args.debug  # Show progress in debug mode
+    )
+    metrics = model.val(verbose=False)
+    return model, {
+        'precision': float(metrics.box.mp),
+        'recall': float(metrics.box.mr),
+        'map50': float(metrics.box.map50)
+    }
+
+
+def build_clip(mapping, images_dir, device):
+    """Build CLIP embeddings"""
+    import clip
+    import torch
+    import numpy as np
+    from PIL import Image
+    
+    model, preprocess = clip.load('ViT-B/32', device=device)
+    embeddings = {}
+    
+    for img_id, products in mapping.items():
+        img_path = images_dir / f'{img_id}.jpg'
+        if not img_path.exists():
+            continue
+        image = Image.open(img_path).convert('RGB')
+        w, h = image.size
+        
+        for prod in products:
+            pid = prod.get('original_product_id', '')
+            if not pid.startswith('B'):
+                continue
+            bbox = prod.get('bbox', [])
+            if len(bbox) != 4:
+                continue
+            
+            x_c, y_c, bw, bh = bbox
+            x1, y1 = int((x_c - bw/2) * w), int((y_c - bh/2) * h)
+            x2, y2 = int((x_c + bw/2) * w), int((y_c + bh/2) * h)
+            crop = image.crop((max(0,x1), max(0,y1), min(w,x2), min(h,y2)))
+            
+            with torch.no_grad():
+                emb = model.encode_image(preprocess(crop).unsqueeze(0).to(device))
+                emb = (emb / emb.norm(dim=-1, keepdim=True)).cpu().numpy().flatten()
+            
+            if pid not in embeddings:
+                embeddings[pid] = []
+            embeddings[pid].append(emb)
+    
+    return model, preprocess, {pid: np.mean(embs, axis=0) for pid, embs in embeddings.items()}
+
+
+def auto_label(yolo, clip_model, preprocess, embeddings, data, device):
+    """Auto-label using YOLO + CLIP + metadata validation"""
+    import torch
+    import numpy as np
+    from PIL import Image
+    
+    new_labels = 0
+    mapping = data['mapping']
+    
+    for meta_file in data['metadata_dir'].glob('*.json'):
+        img_id = meta_file.stem
+        # Skip already labeled images (human OR auto)
+        if img_id in mapping:
+            continue
+        
+        img_path = data['images_dir'] / f'{img_id}.jpg'
+        if not img_path.exists():
+            continue
+        
+        meta = json.load(open(meta_file))
+        meta_products = set(meta.get('BIN_FCSKU_DATA', {}).keys())
+        if not meta_products:
+            continue
+        
+        results = yolo(str(img_path), verbose=False, conf=YOLO_CONF)
+        boxes = [{'bbox': b.xyxy[0].tolist(), 'conf': b.conf[0].item()} 
+                 for r in results for b in r.boxes]
+        
+        # Single product + single box
+        if len(meta_products) == 1 and len(boxes) == 1:
+            pid = list(meta_products)[0]
+            image = Image.open(img_path)
+            w, h = image.size
+            x1, y1, x2, y2 = [int(c) for c in boxes[0]['bbox']]
+            
+            bbox = [((x1+x2)/2)/w, ((y1+y2)/2)/h, (x2-x1)/w, (y2-y1)/h]
+            mapping[img_id] = [{'original_product_id': pid, 'bbox': bbox, 
+                               'yolo_conf': boxes[0]['conf'], 'source': 'auto'}]
+            
+            with open(data['labels_dir'] / f'{img_id}.txt', 'w') as f:
+                f.write(f"0 {bbox[0]:.6f} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f}\n")
+            new_labels += 1
+        
+        # Multi-product: match boxes to products, use elimination for unknowns
+        elif len(boxes) == len(meta_products) and boxes:
+            image = Image.open(img_path).convert('RGB')
+            w, h = image.size
+            
+            # Try to match each box to a product
+            box_matches = []  # [(box, pid or None, conf)]
+            remaining_products = set(meta_products)
+            
+            for box in boxes:
+                x1, y1, x2, y2 = [int(c) for c in box['bbox']]
+                crop = image.crop((x1, y1, x2, y2))
+                
+                with torch.no_grad():
+                    emb = clip_model.encode_image(preprocess(crop).unsqueeze(0).to(device))
+                    emb = (emb / emb.norm(dim=-1, keepdim=True)).cpu().numpy().flatten()
+                
+                # Find best match among remaining products
+                best_pid, best_sim = None, 0
+                for pid in remaining_products:
+                    if pid in embeddings:
+                        sim = float(np.dot(emb, embeddings[pid]))
+                        if sim > best_sim:
+                            best_pid, best_sim = pid, sim
+                
+                if best_pid and best_sim > CLIP_CONF:
+                    box_matches.append((box, best_pid, best_sim))
+                    remaining_products.discard(best_pid)
+                else:
+                    box_matches.append((box, None, best_sim))
+            
+            # Process of elimination: if 1 unmatched box + 1 remaining product
+            unmatched_boxes = [(i, bm) for i, bm in enumerate(box_matches) if bm[1] is None]
+            if len(unmatched_boxes) == 1 and len(remaining_products) == 1:
+                idx, (box, _, _) = unmatched_boxes[0]
+                pid = list(remaining_products)[0]
+                box_matches[idx] = (box, pid, 0.0)  # Assigned by elimination
+            
+            # Check if all boxes are now matched
+            if all(bm[1] is not None for bm in box_matches):
+                labeled = []
+                for box, pid, conf in box_matches:
+                    x1, y1, x2, y2 = [int(c) for c in box['bbox']]
+                    bbox = [((x1+x2)/2)/w, ((y1+y2)/2)/h, (x2-x1)/w, (y2-y1)/h]
+                    source = 'auto' if conf > 0 else 'auto_elimination'
+                    labeled.append({'original_product_id': pid, 'bbox': bbox,
+                                   'yolo_conf': box['conf'], 'clip_conf': conf, 'source': source})
+                
+                mapping[img_id] = labeled
+                with open(data['labels_dir'] / f'{img_id}.txt', 'w') as f:
+                    for l in labeled:
+                        b = l['bbox']
+                        f.write(f"0 {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
+                new_labels += 1
+    
+    with open(data['mapping_file'], 'w') as f:
+        json.dump(mapping, f, indent=2)
+    
+    return new_labels
+
+
+def main():
+    print("=" * 60)
+    print("BINSENSE TRAINING LOOP")
+    print("=" * 60)
+    
+    device = setup()
+    
+    # Debug: show what's in /kaggle/input
+    print("\n[DEBUG] Contents of /kaggle/input/:")
+    input_dir = Path('/kaggle/input')
+    if input_dir.exists():
+        for item in input_dir.iterdir():
+            print(f"  - {item.name}/")
+            if item.is_dir():
+                for sub in list(item.iterdir())[:5]:
+                    print(f"      - {sub.name}")
+    
+    # Find and copy data
+    src = Path('/kaggle/input/binsense-loop/binsense')
+    if not src.exists():
+        src = Path('/kaggle/input/binsense-loop')
+    
+    work = Path('/kaggle/working/data')
+    if work.exists():
+        shutil.rmtree(work)
+    shutil.copytree(src, work)
+    
+    data = {
+        'images_dir': work / 'images',
+        'labels_dir': work / 'labels',
+        'metadata_dir': work / 'metadata',
+        'mapping_file': work / 'product_mapping.json',
+        'data_yaml': work / 'data.yaml',
+        'mapping': json.load(open(work / 'product_mapping.json')) if (work / 'product_mapping.json').exists() else {}
+    }
+    
+    # Results header
+    print(f"\n{'Round':<6} {'Labels':<8} {'Products':<10} {'Precision':<10} {'Recall':<8} {'New':<6}", flush=True)
+    print("-" * 50, flush=True)
+    
+    prev_weights = None
+    last_round = 1
+    for r in range(1, MAX_ROUNDS + 1):
+        try:
+            print(f"\n>>> Starting round {r}...", flush=True)
+            yolo, metrics = train_yolo(data['data_yaml'], r, device, prev_weights)
+            prev_weights = f'/kaggle/working/runs/round_{r}/weights/best.pt'
+            last_round = r
+            
+            clip_model, preprocess, embeddings = build_clip(data['mapping'], data['images_dir'], device)
+            new = auto_label(yolo, clip_model, preprocess, embeddings, data, device)
+            
+            labels = len(list(data['labels_dir'].glob('*.txt')))
+            products = len(set(p['original_product_id'] for ps in data['mapping'].values() for p in ps if p.get('original_product_id','').startswith('B')))
+            
+            print(f"{r:<6} {labels:<8} {products:<10} {metrics['precision']:.4f}    {metrics['recall']:.4f}  {new:<6}", flush=True)
+            
+            # Save backup after each round
+            shutil.copy(f'/kaggle/working/runs/round_{r}/weights/best.pt', f'/kaggle/working/best_round_{r}.pt')
+            
+            if new < MIN_NEW_LABELS:
+                print(f"\nStopping: {new} new labels", flush=True)
+                break
+        except Exception as e:
+            print(f"\n!!! Error in round {r}: {e}", flush=True)
+            break
+    
+    # Save final model
+    best_path = f'/kaggle/working/runs/round_{last_round}/weights/best.pt'
+    if Path(best_path).exists():
+        shutil.copy(best_path, '/kaggle/working/best.pt')
+        print(f"\nSaved: /kaggle/working/best.pt", flush=True)
+    else:
+        print(f"\nWarning: No best.pt found at {best_path}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

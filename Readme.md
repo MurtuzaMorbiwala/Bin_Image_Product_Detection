@@ -47,10 +47,9 @@ Warehouse bins contain multiple products that need to be:
 
 ---
 
-## 🎬 Project Demo
+## 🎬 Project Demo Click on The Image Below 
 [![Project Demo](old_docs/Bin%20Images%20Viewer%20Streamlit.jpg)](https://youtu.be/l2pACkyRZIs)
 
-![Project Walkthrough]()
 *Watch the full project walkthrough and technical explanation by Murtaza Morbiwala*
 
 ### Demo Highlights
